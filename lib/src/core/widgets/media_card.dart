@@ -42,19 +42,21 @@ class PosterCard extends StatelessWidget {
                 aspectRatio: 1 / aspect,
                 child: Stack(
                   children: [
-                    Positioned.fill(
-                      // Тег совпадает с обложкой на экране описания — при
-                      // открытии карточки обложка «перелетает» на новое место.
-                      child: Hero(
-                        tag: 'artwork-${item.id}',
-                        child: Artwork(item: item),
-                      ),
-                    ),
-                    if (item.hasRating)
+                    // Без Hero: одна и та же запись встречается в «Новинках»,
+                    // «Бесплатно целиком» и ленте раздела, а дубли тегов
+                    // ломают переход на экран описания.
+                    Positioned.fill(child: Artwork(item: item)),
+                    if (item.hasScore || item.hasRating)
                       Positioned(
                         top: 10.h,
                         left: 10.w,
-                        child: _RatingChip(rating: item.rating),
+                        child: _RatingChip(item: item),
+                      ),
+                    if (item.isVideo)
+                      Positioned(
+                        left: 10.w,
+                        bottom: item.progress > 0 ? 24.h : 10.h,
+                        child: _ContentBadge(item: item),
                       ),
                     if (onFavoriteToggle != null)
                       Positioned(
@@ -99,7 +101,7 @@ class PosterCard extends StatelessWidget {
               ),
               SizedBox(height: 3.h),
               Text(
-                item.subtitle,
+                item.isVideo ? item.shortMeta : item.subtitle,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
@@ -326,16 +328,20 @@ class SectionHeader extends StatelessWidget {
 }
 
 class _RatingChip extends StatelessWidget {
-  const _RatingChip({required this.rating});
+  const _RatingChip({required this.item});
 
-  final double rating;
+  final MediaItem item;
 
   @override
   Widget build(BuildContext context) {
+    final label = item.isVideo && item.hasScore
+        ? item.scoreLabel
+        : item.rating.toStringAsFixed(1);
+
     return Container(
       padding: EdgeInsets.symmetric(horizontal: 8.w, vertical: 4.h),
       decoration: BoxDecoration(
-        color: AppColors.ink.withValues(alpha: 0.62),
+        color: AppColors.ink.withValues(alpha: 0.66),
         borderRadius: BorderRadius.circular(10.r),
       ),
       child: Row(
@@ -344,11 +350,58 @@ class _RatingChip extends StatelessWidget {
           Icon(Icons.star_rounded, size: 13.r, color: AppColors.series),
           SizedBox(width: 3.w),
           Text(
-            rating.toStringAsFixed(1),
+            label,
             style: TextStyle(
               fontSize: 11.5.sp,
-              fontWeight: FontWeight.w700,
+              fontWeight: FontWeight.w800,
               color: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Метка формата записи: полный фильм или только трейлер.
+///
+/// Пользователь сразу видит, что можно посмотреть целиком, а где доступен
+/// лишь официальный ролик — без этого карточки вводили бы в заблуждение.
+class _ContentBadge extends StatelessWidget {
+  const _ContentBadge({required this.item});
+
+  final MediaItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final full = item.isFreeFull;
+    final tone = full ? AppColors.success : AppColors.textPrimary;
+
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 8.w, vertical: 4.h),
+      decoration: BoxDecoration(
+        color: AppColors.ink.withValues(alpha: 0.7),
+        borderRadius: BorderRadius.circular(9.r),
+        border: Border.all(color: tone.withValues(alpha: 0.35)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            full
+                ? Icons.play_circle_fill_rounded
+                : Icons.smart_display_rounded,
+            size: 12.r,
+            color: tone,
+          ),
+          SizedBox(width: 4.w),
+          Text(
+            full ? 'ПОЛНЫЙ ФИЛЬМ' : 'ТРЕЙЛЕР',
+            style: TextStyle(
+              fontSize: 9.sp,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 0.7,
+              color: tone,
             ),
           ),
         ],

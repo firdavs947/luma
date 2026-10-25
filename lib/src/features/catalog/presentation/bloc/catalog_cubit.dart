@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../../../core/utils/validators.dart';
-import '../../data/mock_catalog.dart';
 import '../../domain/media_item.dart';
 import '../../domain/music_source.dart';
 import '../../domain/video_source.dart';
@@ -13,14 +12,22 @@ import 'catalog_state.dart';
 /// разделам, сортировка видео и работа с избранным.
 ///
 /// Музыка приходит из [MusicSource] (Audius → Genius → локальный фолбэк),
-/// видео — из [VideoSource] (Internet Archive). Благодаря единому контракту
-/// экраны не знают, откуда пришёл контент, а сам кубит не зависит от
-/// реализации источника.
+/// видео — из [VideoSource] (Cinemeta, AniList и Internet Archive).
+/// Благодаря единому контракту экраны не знают, откуда пришёл контент,
+/// а сам кубит не зависит от реализации источника.
 class CatalogCubit extends Cubit<CatalogState> {
   CatalogCubit({
     required this._musicSource,
     required this._videoSource,
-  }) : super(const CatalogState());
+  }) : super(const CatalogState()) {
+    // Базовый каталог обновляется сам: за полчаса в кино и аниме появляются
+    // новые релизы, и пользователю не нужно перезапускать приложение,
+    // чтобы их увидеть. Дополнительно обновление запускается при возврате
+    // приложения на экран (см. `refreshIfStale`).
+    _autoRefresh = Timer.periodic(_autoRefreshInterval, (_) {
+      if (state.status == CatalogStatus.ready) unawaited(refresh(silent: true));
+    });
+  }
 
   final MusicSource _musicSource;
   final VideoSource _videoSource;
@@ -31,6 +38,12 @@ class CatalogCubit extends Cubit<CatalogState> {
   /// Сколько записей идёт в ленту домашнего экрана.
   static const _feedSize = 12;
 
+  /// Сколько полных бесплатных фильмов подтягивается в каталог.
+  static const _freeLimit = 24;
+
+  /// Период автообновления контентной базы.
+  static const _autoRefreshInterval = Duration(minutes: 30);
+
   /// Разделы, наполняемые видеоисточником.
   static const _videoCategories = [
     MediaCategory.movies,
@@ -38,6 +51,14 @@ class CatalogCubit extends Cubit<CatalogState> {
     MediaCategory.cartoons,
     MediaCategory.series,
   ];
+
+  Timer? _autoRefresh;
+
+  /// Первичная загрузка уже выполняется.
+  bool _isLoading = false;
+
+  /// Обновление лент уже выполняется.
+  bool _isRefreshing = false;
 
   /// Номер последнего поискового запроса: ответы на устаревшие запросы
   /// игнорируются, поэтому быстрый ввод не перебивает актуальные результаты.
@@ -63,36 +84,95 @@ class CatalogCubit extends Cubit<CatalogState> {
 
   /// Загружает каталог.
   ///
-  /// Сначала показывается локальный каталог, затем приходят реальные видео
-  /// и музыка — интерфейс не ждёт сеть целиком.
+  /// Сначала показываются видео и полные бесплатные фильмы, затем
+  /// подключается музыка: если музыкальный источник отвечает медленно,
+  /// главный экран всё равно открывается с контентом, а не с пустым экраном.
   Future<void> load() async {
-    if (state.status == CatalogStatus.loading) return;
-    emit(state.copyWith(status: CatalogStatus.loading));
+    if (_isLoading) return;
+    if (state.status == CatalogStatus.ready) return refresh();
 
-    // Короткая пауза под анимацию входа, затем базовый контент.
-    await Future<void>.delayed(const Duration(milliseconds: 360));
-    if (isClosed) return;
-    emit(state.copyWith(status: CatalogStatus.ready, items: MockCatalog.video));
+    _isLoading = true;
+    emit(state.copyWith(status: CatalogStatus.loading, isRefreshing: false));
 
-    final results = await Future.wait([
-      _videoSource.featured(),
-      _musicSource.featured(),
-    ]);
-    if (isClosed) return;
+    try {
+      final video = await _safeList(_videoSource.featured());
+      final free = await _safeList(_videoSource.freeFull(limit: _freeLimit));
+      if (isClosed) return;
 
-    final video = _preserve(results[0]);
-    final music = results[1];
+      emit(
+        state.copyWith(
+          status: CatalogStatus.ready,
+          items: _mergeFeed(video: video, free: free, music: const []),
+          lastUpdated: DateTime.now(),
+        ),
+      );
 
-    emit(
-      state.copyWith(
-        items: [
-          // Если источник видео не ответил, локальный каталог остаётся
-          // каркасом: экран не должен опустеть из-за сетевой ошибки.
-          if (video.isEmpty) ...MockCatalog.video else ...video,
-          ...music,
-        ],
-      ),
-    );
+      final music = await _safeList(_musicSource.featured());
+      if (isClosed) return;
+
+      emit(
+        state.copyWith(
+          items: _mergeFeed(video: video, free: free, music: music),
+        ),
+      );
+    } finally {
+      _isLoading = false;
+    }
+  }
+
+  /// Обновляет ленты без перезапуска приложения.
+  ///
+  /// [silent] — обновление по таймеру или при возврате на экран: индикатор
+  /// не показывается, чтобы интерфейс не мигал без действия пользователя.
+  /// Уже загруженные разделы и избранное сохраняются.
+  Future<void> refresh({bool silent = false}) async {
+    if (_isLoading || _isRefreshing) return;
+    if (state.items.isEmpty) return load();
+
+    _isRefreshing = true;
+    if (!silent) emit(state.copyWith(isRefreshing: true));
+
+    try {
+      final video = await _safeList(_videoSource.featured());
+      final free = await _safeList(_videoSource.freeFull(limit: _freeLimit));
+      final music = await _safeList(_musicSource.featured());
+      if (isClosed) return;
+
+      if (video.isEmpty && free.isEmpty && music.isEmpty) {
+        emit(state.copyWith(isRefreshing: false));
+        return;
+      }
+
+      emit(
+        state.copyWith(
+          status: CatalogStatus.ready,
+          items: _mergeFeed(video: video, free: free, music: music),
+          isRefreshing: false,
+          lastUpdated: DateTime.now(),
+        ),
+      );
+    } finally {
+      _isRefreshing = false;
+    }
+  }
+
+  /// Обновляет каталог, если данные устарели.
+  ///
+  /// Вызывается при возврате приложения из фона: если с прошлого обновления
+  /// прошло больше [maxAge], ленты перезагружаются без индикатора.
+  Future<void> refreshIfStale({
+    Duration maxAge = const Duration(minutes: 15),
+  }) async {
+    if (state.status != CatalogStatus.ready) return;
+    final last = state.lastUpdated;
+    if (last != null && DateTime.now().difference(last) < maxAge) return;
+    await refresh(silent: true);
+  }
+
+  @override
+  Future<void> close() {
+    _autoRefresh?.cancel();
+    return super.close();
   }
 
   /// Валидирует и выполняет поиск по видео и музыке.
@@ -270,13 +350,15 @@ class CatalogCubit extends Cubit<CatalogState> {
 
     // Раздел не выбран — пересобираем ленты всех видеонаправлений.
     final video = await _overview(sort);
+    final free = await _safeList(_videoSource.freeFull(limit: _freeLimit));
     if (isClosed) return;
 
+    final music = state.items.where((item) => !item.isVideo).toList();
     emit(
       state.copyWith(
         items: [
-          ..._preserve(video),
-          ...state.items.where((item) => item.category == MediaCategory.music),
+          ..._preserve(_unique([...video, ...free])),
+          ...music,
         ],
       ),
     );
@@ -314,21 +396,30 @@ class CatalogCubit extends Cubit<CatalogState> {
       if (isClosed) return;
 
       _nextPage[category] = page + 1;
+      if (reset || items.length >= _pageSize) {
+        _exhausted.remove(category);
+      }
       if (items.length < _pageSize) _exhausted.add(category);
 
       final fresh = _preserve(items);
-      final rest = state.items.where((item) => item.category != category);
-      final existingIds = {for (final item in rest) item.id};
+      // При смене сортировки старые записи раздела заменяются, но полные
+      // бесплатные фильмы остаются: они не зависят от ленты Cinemeta.
+      final base = reset
+          ? state.items
+                .where(
+                  (item) => item.category != category || item.isFreeFull,
+                )
+                .toList()
+          : state.items;
 
       emit(
         state.copyWith(
           // Пустой ответ не должен стирать уже показанную ленту.
           items: fresh.isEmpty
               ? state.items
-              : [
-                  ...rest,
-                  ...fresh.where((item) => !existingIds.contains(item.id)),
-                ],
+              : reset
+              ? _unique([...fresh, ...base])
+              : _unique([...base, ...fresh]),
           clearLoadingCategory: true,
           categoryHasMore: !_exhausted.contains(category),
         ),
@@ -345,36 +436,161 @@ class CatalogCubit extends Cubit<CatalogState> {
 
   /// Добавляет или убирает элемент из избранного.
   ///
-  /// Если элемента ещё нет в каталоге (например, трек Genius), он
-  /// добавляется — избранное работает для любого контента.
+  /// Если элемента ещё нет в каталоге (например, результат поиска), он
+  /// добавляется — избранное работает для любого контента и сразу видно
+  /// в соответствующем разделе.
   void toggleFavorite(MediaItem item) {
-    final index = state.items.indexWhere((entry) => entry.id == item.id);
+    final current = state.byId(item.id) ?? _searchItem(item.id) ?? item;
+    final next = current.copyWith(isFavorite: !current.isFavorite);
 
-    if (index == -1) {
-      emit(
-        state.copyWith(
-          items: [...state.items, item.copyWith(isFavorite: true)],
-        ),
-      );
-      return;
-    }
+    final exists = state.items.any((entry) => entry.id == item.id);
+    final items = exists
+        ? [
+            for (final entry in state.items)
+              entry.id == item.id ? next : entry,
+          ]
+        : [...state.items, next];
 
-    final updated = [...state.items];
-    final entry = updated[index];
-    updated[index] = entry.copyWith(isFavorite: !entry.isFavorite);
-    emit(state.copyWith(items: updated));
+    emit(
+      state.copyWith(
+        items: items,
+        searchResults: [
+          for (final entry in state.searchResults)
+            entry.id == item.id ? next : entry,
+        ],
+      ),
+    );
   }
 
   /// Обновляет прогресс просмотра или прослушивания.
+  ///
+  /// Элемент может прийти из поиска и ещё не быть в каталоге — тогда он
+  /// добавляется, чтобы «Продолжить просмотр» не терял начатый фильм.
   void updateProgress(String id, double progress) {
-    final updated = [
-      for (final item in state.items)
-        if (item.id == id)
-          item.copyWith(progress: progress.clamp(0.0, 1.0))
-        else
-          item,
-    ];
-    emit(state.copyWith(items: updated));
+    final value = progress.clamp(0.0, 1.0);
+    var found = false;
+
+    final items = <MediaItem>[];
+    for (final entry in state.items) {
+      if (entry.id == id) {
+        items.add(entry.copyWith(progress: value));
+        found = true;
+      } else {
+        items.add(entry);
+      }
+    }
+
+    if (!found) {
+      final match = state.byId(id) ?? _searchItem(id);
+      if (match != null) items.add(match.copyWith(progress: value));
+    }
+
+    emit(
+      state.copyWith(
+        items: items,
+        searchResults: [
+          for (final entry in state.searchResults)
+            entry.id == id ? entry.copyWith(progress: value) : entry,
+        ],
+      ),
+    );
+  }
+
+  MediaItem? _searchItem(String id) {
+    for (final item in state.searchResults) {
+      if (item.id == id) return item;
+    }
+    return null;
+  }
+
+  /// Свежие ленты + уже загруженный каталог без дублей.
+  ///
+  /// Свежие записи идут первыми, поэтому новинки видны сразу. Загруженные
+  /// ранее разделы, избранное и начатые фильмы сохраняются, но общий список
+  /// ограничен, чтобы автообновление не росло бесконечно.
+  List<MediaItem> _mergeFeed({
+    required List<MediaItem> video,
+    required List<MediaItem> free,
+    required List<MediaItem> music,
+  }) {
+    final current = {for (final item in state.items) item.id: item};
+    final fresh = <MediaItem>[];
+    final seenIds = <String>{};
+    final seenImdb = <String>{};
+
+    for (final item in [...video, ...free, ...music]) {
+      final old = current[item.id];
+      final next = old == null
+          ? item
+          : item.copyWith(
+              isFavorite: old.isFavorite,
+              progress: old.progress,
+            );
+      if (!seenIds.add(next.id)) continue;
+      final imdb = next.imdbId;
+      if (imdb != null && imdb.isNotEmpty && !seenImdb.add(imdb)) continue;
+      fresh.add(next);
+    }
+
+    if (state.items.isEmpty) return fresh;
+
+    final saved = <MediaItem>[];
+    final others = <MediaItem>[];
+    for (final old in state.items) {
+      if (seenIds.contains(old.id)) continue;
+      final imdb = old.imdbId;
+      if (imdb != null && imdb.isNotEmpty && seenImdb.contains(imdb)) {
+        continue;
+      }
+      if (old.isFavorite || old.progress > 0) {
+        saved.add(old);
+      } else {
+        others.add(old);
+      }
+    }
+
+    final merged = [...fresh, ...saved];
+    var videos = merged.where((item) => item.isVideo).length;
+    var musicCount = merged.where((item) => !item.isVideo).length;
+
+    for (final item in others) {
+      if (item.isVideo) {
+        if (videos >= 240) continue;
+        videos++;
+      } else {
+        if (musicCount >= 120) continue;
+        musicCount++;
+      }
+      merged.add(item);
+    }
+    return merged;
+  }
+
+  /// Дубликаты по id и IMDb: одна и та же запись из разных источников
+  /// не должна появляться в ленте дважды.
+  static List<MediaItem> _unique(List<MediaItem> items) {
+    final seenIds = <String>{};
+    final seenImdb = <String>{};
+    final result = <MediaItem>[];
+    for (final item in items) {
+      if (!seenIds.add(item.id)) continue;
+      final imdb = item.imdbId;
+      if (imdb != null && imdb.isNotEmpty && !seenImdb.add(imdb)) continue;
+      result.add(item);
+    }
+    return result;
+  }
+
+  /// Источник может быть недоступен: пустой список не должен ломать
+  /// загрузку остальных лент.
+  static Future<List<MediaItem>> _safeList(
+    Future<List<MediaItem>> future,
+  ) async {
+    try {
+      return await future;
+    } catch (_) {
+      return const [];
+    }
   }
 
   /// Ленты всех видеонаправлений, собранные «вперемешку».
@@ -434,12 +650,19 @@ class CatalogCubit extends Cubit<CatalogState> {
   }
 
   /// Объединяет результаты без дублей: локальные совпадения идут первыми.
+  ///
+  /// Одна и та же запись может прийти из Cinemeta, AniList и архива с
+  /// разными id, поэтому дополнительно сверяется IMDb-идентификатор.
   List<MediaItem> _merge(List<MediaItem> local, List<MediaItem> remote) {
-    final seen = <String>{};
+    final seenIds = <String>{};
+    final seenImdb = <String>{};
     final merged = <MediaItem>[];
 
     for (final item in [...local, ...remote]) {
-      if (seen.add(item.id)) merged.add(item);
+      if (!seenIds.add(item.id)) continue;
+      final imdb = item.imdbId;
+      if (imdb != null && imdb.isNotEmpty && !seenImdb.add(imdb)) continue;
+      merged.add(item);
     }
     return merged;
   }

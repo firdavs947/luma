@@ -36,6 +36,15 @@ class VideoVariant {
   int get weight => height ?? (bandwidth ?? 0) ~/ 1000;
 }
 
+/// Что именно открывает плеер.
+enum PlaybackKind {
+  /// Полная запись: фильм или другой файл целиком.
+  fullFilm,
+
+  /// Официальный трейлер: полная версия в приложении недоступна.
+  trailer,
+}
+
 /// Готовый к воспроизведению видеопоток.
 class VideoStream {
   const VideoStream({
@@ -43,9 +52,16 @@ class VideoStream {
     this.variants = const [],
     this.isAdaptive = false,
     this.mimeType,
+    this.kind = PlaybackKind.fullFilm,
+    this.youtubeId,
+    this.providerLabel,
+    this.pageUrl,
   });
 
   /// Ссылка по умолчанию.
+  ///
+  /// Для трейлера это страница ролика на YouTube — она нужна кнопке
+  /// «Открыть на YouTube»; сам кадр в приложении строит iframe-плеер.
   final String url;
 
   /// Альтернативные качества для ручного переключения.
@@ -57,13 +73,30 @@ class VideoStream {
 
   /// MIME-тип выбранного файла.
   final String? mimeType;
+
+  /// Полная запись или трейлер.
+  final PlaybackKind kind;
+
+  /// Идентификатор ролика YouTube для встроенного плеера.
+  final String? youtubeId;
+
+  /// Подпись источника для интерфейса: «Internet Archive · полный фильм»,
+  /// «Официальный трейлер».
+  final String? providerLabel;
+
+  /// Страница источника, которую можно открыть в браузере.
+  final String? pageUrl;
+
+  bool get isTrailer => kind == PlaybackKind.trailer;
+
+  bool get isYoutube => youtubeId != null && youtubeId!.isNotEmpty;
 }
 
 /// Источник видеоконтента.
 ///
 /// Интерфейс намеренно повторяет музыкальный: каталог не знает, откуда
 /// приходит видео, поэтому источник можно заменить, не трогая экраны.
-abstract interface class VideoSource {
+abstract class VideoSource {
   /// Курируемая лента видео по всем разделам для главного экрана.
   Future<List<MediaItem>> featured();
 
@@ -86,6 +119,23 @@ abstract interface class VideoSource {
   ///
   /// Возвращает `null`, если у записи нет ни одного поддерживаемого файла.
   Future<VideoStream?> resolveStream(MediaItem item);
+
+  /// Дополняет карточку подробностями, которые не нужны в лентах:
+  /// описанием, актёрами, режиссёрами и точной длительностью.
+  ///
+  /// Источники, которые уже отдают полные данные, возвращают элемент как есть.
+  Future<MediaItem> enrich(MediaItem item) async => item;
+
+  /// Ищет полную бесплатную версию фильма или сериала в Internet Archive.
+  ///
+  /// Для свежих релизов возвращает `null`: они защищены авторским правом,
+  /// поэтому в приложении доступен только официальный трейлер.
+  Future<MediaItem?> fullVersionOf(MediaItem item) async => null;
+
+  /// Полные фильмы, доступные для просмотра целиком и бесплатно.
+  ///
+  /// Источники, у которых нет таких записей, возвращают пустой список.
+  Future<List<MediaItem>> freeFull({int limit = 24}) async => const [];
 }
 
 /// Порядок сортировки видеокаталога.

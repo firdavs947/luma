@@ -13,7 +13,7 @@
     <!-- Для автоматического перезапуска сервиса после перезагрузки устройства (опционально, но полезно для стабильности). -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <application
-        android:label="animation_test_app"
+        android:label="LUMA"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

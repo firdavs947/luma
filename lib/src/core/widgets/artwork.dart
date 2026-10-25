@@ -1,5 +1,7 @@
 import 'dart:math' as math;
 
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 
@@ -19,15 +21,24 @@ class Artwork extends StatelessWidget {
     required this.item,
     this.borderRadius = 22,
     this.showMonogram = true,
+    this.useBackdrop = false,
   });
 
   final MediaItem item;
   final double borderRadius;
   final bool showMonogram;
 
+  /// Взять широкий кадр 16:9 вместо постера.
+  ///
+  /// Нужен hero-карусели и экрану описания: постер там обрезается так, что
+  /// теряет композицию, а фон — уже готовая обложка фильма.
+  final bool useBackdrop;
+
   @override
   Widget build(BuildContext context) {
-    final imageUrl = item.imageUrl;
+    final imageUrl = useBackdrop
+        ? (item.backdropUrl ?? item.imageUrl)
+        : item.imageUrl;
 
     return RepaintBoundary(
       child: ClipRRect(
@@ -70,31 +81,121 @@ class Artwork extends StatelessWidget {
 ///
 /// Пока картинка грузится (или если она недоступна), видна процедурная
 /// подложка — поэтому обложка никогда не «мигает» пустотой.
-class _RemoteArtwork extends StatelessWidget {
+class _RemoteArtwork extends StatefulWidget {
   const _RemoteArtwork({required this.url});
 
   final String url;
 
   @override
-  Widget build(BuildContext context) {
-    // Обложка импортированного трека лежит на устройстве, поэтому
-    // подгружается как локальный файл — сеть для неё не нужна.
-    final local = localImageProvider(url);
+  State<_RemoteArtwork> createState() => _RemoteArtworkState();
+}
 
-    return Image(
-      image: local ?? NetworkImage(url),
-      fit: BoxFit.cover,
-      gaplessPlayback: true,
-      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-        if (wasSynchronouslyLoaded) return child;
-        return AnimatedOpacity(
-          opacity: frame == null ? 0 : 1,
-          duration: const Duration(milliseconds: 420),
-          curve: Curves.easeOutCubic,
-          child: child,
+class _RemoteArtworkState extends State<_RemoteArtwork> {
+  /// Прямой адрес не отдался — грузим через CORS-прокси.
+  bool _viaProxy = false;
+
+  /// Ширина загрузки в физических пикселях.
+  ///
+  /// Постер Metahub — 780 px, фон — 1920 px. Качать и держать в памяти
+  /// оригинал для миниатюры 148 dp бессмысленно, поэтому размер считается
+  /// от реального места на экране с учётом плотности пикселей.
+  int _decodeWidth(BuildContext context, BoxConstraints constraints) {
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    final logical = constraints.hasBoundedWidth
+        ? constraints.maxWidth
+        : MediaQuery.sizeOf(context).width;
+    return (logical * dpr).round().clamp(160, 1920);
+  }
+
+  String _proxied(String url, int width) {
+    if (!url.startsWith('http')) return url;
+    return 'https://wsrv.nl/?url=${Uri.encodeComponent(url)}'
+        '&w=$width&output=webp&q=90';
+  }
+
+  void _switchToProxy() {
+    if (_viaProxy) return;
+    // Ошибка приходит во время сборки, поэтому состояние меняем после кадра.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() => _viaProxy = true);
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _RemoteArtwork oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.url != widget.url) _viaProxy = false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Обложка импортированного трека лежит на устройстве: сеть не нужна.
+    final local = localImageProvider(widget.url);
+    if (local != null) {
+      return Image(
+        image: local,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        filterQuality: FilterQuality.medium,
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = _decodeWidth(context, constraints);
+        final url = _viaProxy
+            ? _proxied(widget.url, width)
+            : widget.url;
+
+        if (kIsWeb) {
+          // На вебе сетевые файлы читаются через XHR, а CDN-постеры не
+          // всегда отдают CORS-заголовки. Ошибка загрузки переключает на
+          // прокси, который возвращает картинку с разрешённым источником.
+          return Image.network(
+            url,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.medium,
+            cacheWidth: width,
+            frameBuilder: _fadeIn,
+            errorBuilder: (context, error, stackTrace) {
+              _switchToProxy();
+              return const SizedBox.shrink();
+            },
+          );
+        }
+
+        return CachedNetworkImage(
+          imageUrl: url,
+          fit: BoxFit.cover,
+          filterQuality: FilterQuality.medium,
+          memCacheWidth: width,
+          maxWidthDiskCache: 1280,
+          fadeInDuration: const Duration(milliseconds: 380),
+          fadeOutDuration: const Duration(milliseconds: 200),
+          placeholder: (context, _) => const SizedBox.shrink(),
+          errorWidget: (context, _, _) {
+            _switchToProxy();
+            return const SizedBox.shrink();
+          },
         );
       },
-      errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+    );
+  }
+
+  /// Плавное проявление кадра поверх процедурной подложки.
+  Widget _fadeIn(
+    BuildContext context,
+    Widget child,
+    int? frame,
+    bool wasSynchronouslyLoaded,
+  ) {
+    if (wasSynchronouslyLoaded) return child;
+    return AnimatedOpacity(
+      opacity: frame == null ? 0 : 1,
+      duration: const Duration(milliseconds: 420),
+      curve: Curves.easeOutCubic,
+      child: child,
     );
   }
 }

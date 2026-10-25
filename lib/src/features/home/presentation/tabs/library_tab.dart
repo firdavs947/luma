@@ -30,7 +30,7 @@ class _LibraryTabState extends State<LibraryTab> {
 
   int _section = 0;
 
-  static const _labels = ['Избранное', 'Продолжить', 'Офлайн', 'Загрузки'];
+  static const _labels = ['Избранное', 'Продолжить', 'Бесплатно', 'Загрузки'];
 
   @override
   Widget build(BuildContext context) {
@@ -86,8 +86,8 @@ class _LibraryTabState extends State<LibraryTab> {
               Reveal(
                 delay: Duration(milliseconds: 80),
                 child: Text(
-                  'Всё, что вы сохранили, смотрите и слушаете — '
-                  'в одном месте.',
+                  'Избранное, продолжение просмотра и полные фильмы '
+                  'без подписки — в одном месте.',
                   style: TextStyle(
                     fontSize: 13.5.sp,
                     color: AppColors.textMuted,
@@ -116,11 +116,36 @@ class _LibraryTabState extends State<LibraryTab> {
     final items = switch (_section) {
       0 => state.favorites,
       1 => state.continueWatching,
-      _ => state.items.where((item) => item.rating >= 4.6).toList(),
+      // Публичные фильмы из Internet Archive: их можно смотреть целиком,
+      // бесплатно и без подписки.
+      _ => state.freeItems,
     };
 
     if (items.isEmpty) {
-      return [SliverToBoxAdapter(child: _EmptyLibrary(section: _labels[_section]))];
+      return [
+        SliverToBoxAdapter(
+          child: switch (_section) {
+            0 => const _EmptyLibrary(
+              section: 'Избранное',
+              icon: Icons.bookmark_add_outlined,
+              message: 'Добавляйте фильмы и музыку в избранное — '
+                  'они появятся здесь.',
+            ),
+            1 => const _EmptyLibrary(
+              section: 'Продолжить',
+              icon: Icons.play_circle_outline_rounded,
+              message: 'Начните смотреть фильм — прогресс сохранится '
+                  'и появится здесь.',
+            ),
+            _ => const _EmptyLibrary(
+              section: 'Бесплатно',
+              icon: Icons.movie_filter_outlined,
+              message: 'Полные фильмы без подписки появятся здесь, '
+                  'как только каталог загрузит их из Internet Archive.',
+            ),
+          },
+        ),
+      ];
     }
 
     return [
@@ -385,7 +410,7 @@ class _SegmentedControl extends StatelessWidget {
                   alignment: Alignment.center,
                   padding: EdgeInsets.symmetric(
                     vertical: 11.h,
-                    horizontal: 4.w,
+                    horizontal: 2.w,
                   ),
                   decoration: BoxDecoration(
                     color: index == selected
@@ -399,8 +424,9 @@ class _SegmentedControl extends StatelessWidget {
                       labels[index],
                       maxLines: 1,
                       style: TextStyle(
-                        fontSize: 13.5.sp,
+                        fontSize: 12.5.sp,
                         fontWeight: FontWeight.w700,
+                        letterSpacing: -0.2,
                         color: index == selected
                             ? Colors.white
                             : AppColors.textMuted,
@@ -419,9 +445,8 @@ class _SegmentedControl extends StatelessWidget {
 class _EmptyLibrary extends StatelessWidget {
   const _EmptyLibrary({
     required this.section,
+    required this.message,
     this.icon = Icons.bookmark_add_outlined,
-    this.message = 'Добавляйте контент в избранное — он появится здесь и будет '
-        'доступен даже без интернета.',
   });
 
   final String section;

@@ -28,6 +28,8 @@ class CatalogState extends Equatable {
     this.videoSort = VideoSort.popular,
     this.loadingCategory,
     this.categoryHasMore = false,
+    this.isRefreshing = false,
+    this.lastUpdated,
   });
 
   final CatalogStatus status;
@@ -73,6 +75,15 @@ class CatalogState extends Equatable {
   /// Есть ли у источника ещё страницы выбранного раздела.
   final bool categoryHasMore;
 
+  /// Идёт фоновое обновление лент (кнопка обновления или автообновление).
+  final bool isRefreshing;
+
+  /// Когда каталог последний раз успешно обновился.
+  ///
+  /// По времени видно, что новинки подтянулись, а также решается, нужно ли
+  /// обновлять базу при возврате приложения на экран.
+  final DateTime? lastUpdated;
+
   bool get isSearching => query.trim().isNotEmpty;
 
   /// Ожидаем ли ещё результаты поиска.
@@ -97,15 +108,60 @@ class CatalogState extends Equatable {
   List<MediaItem> get favorites =>
       items.where((item) => item.isFavorite).toList();
 
-  /// Элемент для верхнего баннера: первый видеоматериал каталога.
+  /// Только видео: музыкальные треки живут в своих разделах.
+  List<MediaItem> get videoItems =>
+      items.where((item) => item.isVideo).toList();
+
+  /// Полные фильмы, доступные для просмотра целиком и бесплатно.
+  List<MediaItem> get freeItems {
+    final list = items.where((item) => item.isFreeFull).toList();
+    list.sort((a, b) => b.displayScore.compareTo(a.displayScore));
+    return list;
+  }
+
+  /// Новинки: свежие фильмы, сериалы, мультфильмы и аниме.
   ///
-  /// Пока источник не ответил, баннер показывает локальный плейсхолдер,
-  /// поэтому `null` — нормальная ситуация, а не ошибка.
+  /// Сортируются по точной дате выхода, а при её отсутствии — по году.
+  /// Свежие релизы оказываются первыми даже после догрузки разделов.
+  List<MediaItem> get newItems {
+    final list = [
+      for (final item in items)
+        if (item.isVideo && !item.isFreeFull) item,
+    ];
+    list.sort((a, b) => _recency(b).compareTo(_recency(a)));
+    return list.take(14).toList();
+  }
+
+  /// Элементы для hero-карусели: сначала широкие кадры 16:9.
+  ///
+  /// Если у источника ещё нет фонов, используется обычная обложка, поэтому
+  /// карусель никогда не остаётся пустой при наличии видео.
+  List<MediaItem> get heroItems {
+    final withBackdrop = [
+      for (final item in items)
+        if (item.isVideo && (item.backdropUrl?.isNotEmpty ?? false)) item,
+    ];
+    if (withBackdrop.length >= 4) return withBackdrop.take(7).toList();
+    return videoItems.take(6).toList();
+  }
+
+  /// Элемент для верхнего баннера: первый видеоэлемент hero-карусели.
+  ///
+  /// Пока источник не ответил, баннер не показывается — вместо вымышленного
+  /// контента интерфейс выводит skeleton.
   MediaItem? get featured {
+    final heroes = heroItems;
+    if (heroes.isNotEmpty) return heroes.first;
     for (final item in items) {
       if (item.isVideo) return item;
     }
     return null;
+  }
+
+  static int _recency(MediaItem item) {
+    final date = DateTime.tryParse(item.releaseDate ?? '');
+    if (date != null) return date.millisecondsSinceEpoch;
+    return item.releaseYear * 10000 + 101;
   }
 
   /// Элементы раздела (без учёта фильтра поиска).
@@ -133,6 +189,8 @@ class CatalogState extends Equatable {
     VideoSort? videoSort,
     MediaCategory? loadingCategory,
     bool? categoryHasMore,
+    bool? isRefreshing,
+    DateTime? lastUpdated,
     bool clearQueryError = false,
     bool clearCategory = false,
     bool clearLoadingCategory = false,
@@ -153,6 +211,8 @@ class CatalogState extends Equatable {
       loadingCategory:
           clearLoadingCategory ? null : (loadingCategory ?? this.loadingCategory),
       categoryHasMore: categoryHasMore ?? this.categoryHasMore,
+      isRefreshing: isRefreshing ?? this.isRefreshing,
+      lastUpdated: lastUpdated ?? this.lastUpdated,
     );
   }
 
@@ -171,5 +231,7 @@ class CatalogState extends Equatable {
         videoSort,
         loadingCategory,
         categoryHasMore,
+        isRefreshing,
+        lastUpdated,
       ];
 }

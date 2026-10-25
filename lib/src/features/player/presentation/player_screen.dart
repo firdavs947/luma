@@ -6,7 +6,9 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart' as bg;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
+import 'package:youtube_player_iframe/youtube_player_iframe.dart' as yt;
 
 import '../../../core/audio/audio_engine.dart';
 import '../../../core/audio/track_stream_resolver.dart';
@@ -15,6 +17,7 @@ import '../../../core/widgets/artwork.dart';
 import '../../catalog/domain/media_item.dart';
 import '../../catalog/domain/video_source.dart';
 import '../../catalog/presentation/bloc/catalog_cubit.dart';
+import 'widgets/trailer_stage.dart';
 import 'widgets/video_stage.dart';
 
 /// Экран воспроизведения.
@@ -78,6 +81,16 @@ class _PlayerScreenState extends State<PlayerScreen>
   /// уничтожается при переходе к аудио или при закрытии экрана.
   VideoPlayerController? _video;
 
+  /// Встроенный YouTube-плеер официального трейлера.
+  yt.YoutubePlayerController? _youtube;
+  StreamSubscription<yt.YoutubePlayerValue>? _youtubeSub;
+
+  /// Трейлер не удалось открыть: предлагаем повтор и переход на YouTube.
+  bool _trailerFailed = false;
+
+  /// Текущий элемент играет как трейлер, а не как полный фильм.
+  bool _isTrailer = false;
+
   /// Разрешённый поток текущего видео: из него берутся варианты качества.
   VideoStream? _videoStream;
 
@@ -86,6 +99,22 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   /// Поток не удалось открыть.
   bool _videoFailed = false;
+
+  /// Поколение открытия. Ответ источника, пришедший после переключения
+  /// элемента, отбрасывается и не запускает чужое видео.
+  int _loadToken = 0;
+
+  /// Доля, с которой нужно продолжить просмотр после открытия файла.
+  double? _pendingResume;
+
+  /// Адреса, которые уже не открылись: повторно их не пробуем.
+  final Set<String> _failedUrls = {};
+
+  /// Идёт перебор вариантов качества — ошибки кадра пока не обрабатываем.
+  bool _starting = false;
+
+  /// Уже выполняется переход на резервный файл.
+  bool _recovering = false;
 
   /// Виден ли оверлей управления поверх видеокадра.
   bool _controlsVisible = true;
@@ -115,6 +144,10 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   /// Идёт ли воспроизведение через видеоплеер.
   bool get _usesVideo => _video != null && !_videoFailed;
+
+  /// Играет ли встроенный YouTube-трейлер.
+  bool get _usesTrailer =>
+      _isTrailer && _youtube != null && !_trailerFailed;
 
   /// Подпись выбранного качества для бейджа на кадре.
   String? get _qualityLabel => _selectedVariant?.label;
@@ -273,33 +306,51 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   /// Разрешает поток видео и запускает воспроизведение.
   ///
-  /// Качество выбирает сам источник: перед выдачей он замеряет пропускную
-  /// способность канала и берёт подходящий по битрейту файл. Если поток
-  /// недоступен, сцена показывает кнопку повторной попытки, а не пустой кадр.
+  /// Каждый сетевой шаг ограничен таймаутом: если источник молчит, сцена
+  /// показывает повторную попытку, а не бесконечный индикатор загрузки.
+  /// Файлы перебираются по вариантам качества, а записи без файла
+  /// открываются официальным трейлером на YouTube.
   Future<void> _openVideo(MediaItem item) async {
+    final token = ++_loadToken;
+
     _disposeVideo();
     _videoStream = null;
     _selectedVariant = null;
     _videoFailed = false;
+    _trailerFailed = false;
+    _isTrailer = false;
     _duration = null;
     _elapsed.value = Duration.zero;
+    _failedUrls.clear();
+    _pendingResume = item.progress >= 0.02 && item.progress <= 0.95
+        ? item.progress
+        : null;
 
     try {
-      final stream = await context.read<VideoSource>().resolveStream(item);
-      if (!mounted) return;
+      final stream = await context
+          .read<VideoSource>()
+          .resolveStream(item)
+          .timeout(const Duration(seconds: 25));
+      if (!mounted || token != _loadToken) return;
 
-      if (stream == null || stream.url.isEmpty) {
+      if (stream == null || (!stream.isYoutube && stream.url.isEmpty)) {
         _failVideo(item);
         return;
       }
 
       _videoStream = stream;
+
+      if (stream.isYoutube) {
+        _openTrailer(stream);
+        return;
+      }
+
       _selectedVariant = _variantFor(stream);
-      await _startController();
+      await _startController(token: token);
     } catch (_) {
       // Сбой платформы, отсутствие декодера и сетевые ошибки приводят к
       // разным типам исключений, поэтому ловим их все одинаково.
-      if (!mounted) return;
+      if (!mounted || token != _loadToken) return;
       _failVideo(item);
     }
   }
@@ -309,52 +360,143 @@ class _PlayerScreenState extends State<PlayerScreen>
     for (final variant in stream.variants) {
       if (variant.url == stream.url) return variant;
     }
-    return stream.variants.isEmpty ? null : stream.variants.first;
+    if (stream.variants.isEmpty) return null;
+    return stream.variants.reduce(
+      (best, variant) => variant.weight > best.weight ? variant : best,
+    );
   }
 
-  /// Создаёт контроллер для выбранного варианта и запускает его.
+  /// Очередь вариантов: выбранный пользователем, затем остальные по
+  /// убыванию качества. Уже упавшие адреса пропускаются, поэтому один
+  /// недоступный файл не лишает пользователя всего фильма.
+  List<VideoVariant> _candidatesFor(VideoStream stream) {
+    final ordered = <VideoVariant>[];
+    final preferred = _selectedVariant;
+
+    if (preferred != null && !_failedUrls.contains(preferred.url)) {
+      ordered.add(preferred);
+    }
+
+    final rest =
+        stream.variants
+            .where(
+              (variant) =>
+                  variant.url != preferred?.url &&
+                  !_failedUrls.contains(variant.url),
+            )
+            .toList()
+          ..sort((a, b) => b.weight.compareTo(a.weight));
+    ordered.addAll(rest);
+
+    if (ordered.isEmpty &&
+        stream.variants.isEmpty &&
+        stream.url.isNotEmpty &&
+        !_failedUrls.contains(stream.url)) {
+      ordered.add(
+        VideoVariant(url: stream.url, label: '', mimeType: stream.mimeType),
+      );
+    }
+
+    return ordered;
+  }
+
+  /// Создаёт контроллер для подходящего варианта и запускает его.
+  ///
+  /// При ошибке инициализации пробует следующий файл. Если не открылся ни
+  /// один, сцена показывает «поток недоступен» с кнопкой повтора.
   Future<void> _startController({
-    Duration startAt = Duration.zero,
+    Duration? startAt,
     bool autoplay = true,
+    int? token,
   }) async {
-    final url = _selectedVariant?.url ?? _videoStream?.url;
-    if (url == null || url.isEmpty) {
+    final ownToken = token ?? _loadToken;
+    final stream = _videoStream;
+    if (stream == null) {
       _failVideo(_item);
       return;
     }
 
-    final controller = VideoPlayerController.networkUrl(
-      Uri.parse(url),
-      videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
-    );
-    _video = controller;
-    controller.addListener(_onVideoTick);
+    // Три попытки — разумный предел: перебор всех кодировок подряд
+    // превратил бы загрузку в долгое ожидание при недоступном источнике.
+    final candidates = _candidatesFor(stream).take(3).toList();
+    if (candidates.isEmpty) {
+      _failVideo(_item);
+      return;
+    }
 
+    _starting = true;
     try {
-      await controller.initialize();
-    } catch (_) {
-      if (identical(_video, controller)) _disposeVideo();
-      if (mounted) _failVideo(_item);
-      return;
+      for (final variant in candidates) {
+        if (!mounted || ownToken != _loadToken) return;
+
+        final controller = VideoPlayerController.networkUrl(
+          Uri.parse(variant.url),
+          videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
+        );
+        _video = controller;
+        controller.addListener(_onVideoTick);
+
+        try {
+          await controller
+              .initialize()
+              .timeout(const Duration(seconds: 15));
+        } catch (_) {
+          _failedUrls.add(variant.url);
+          if (identical(_video, controller)) _video = null;
+          controller.removeListener(_onVideoTick);
+          unawaited(controller.dispose());
+          continue;
+        }
+
+        if (!mounted || ownToken != _loadToken) {
+          if (identical(_video, controller)) _video = null;
+          controller.removeListener(_onVideoTick);
+          unawaited(controller.dispose());
+          return;
+        }
+
+        if (variant.label.isNotEmpty) _selectedVariant = variant;
+        _videoFailed = false;
+        _duration = controller.value.duration;
+        _elapsed.value = controller.value.position;
+
+        await controller.setVolume(_muted ? 0 : _volume);
+
+        var resume = startAt;
+        final pending = _pendingResume;
+        if (resume == null && pending != null) {
+          _pendingResume = null;
+          final total = controller.value.duration;
+          if (total > Duration.zero) resume = total * pending;
+        }
+        final total = _duration;
+        if (resume != null &&
+            total != null &&
+            resume > const Duration(seconds: 3) &&
+            resume < total) {
+          await controller.seekTo(resume);
+          _elapsed.value = resume;
+        }
+
+        if (!mounted || ownToken != _loadToken) {
+          if (identical(_video, controller)) _video = null;
+          controller.removeListener(_onVideoTick);
+          unawaited(controller.dispose());
+          return;
+        }
+
+        setState(() => _playing = autoplay);
+        if (autoplay) {
+          unawaited(controller.play());
+          _startControlsTimer();
+        }
+        return;
+      }
+    } finally {
+      _starting = false;
     }
 
-    if (!mounted) {
-      await controller.dispose();
-      return;
-    }
-
-    await controller.setVolume(_muted ? 0 : _volume);
-    if (startAt > Duration.zero) await controller.seekTo(startAt);
-
-    _duration = controller.value.duration;
-    _elapsed.value = controller.value.position;
-    _playing = autoplay;
-    setState(() {});
-
-    if (autoplay) {
-      await controller.play();
-      _startControlsTimer();
-    }
+    if (mounted && ownToken == _loadToken) _failVideo(_item);
   }
 
   /// Переключает качество, сохраняя позицию и состояние воспроизведения.
@@ -367,13 +509,122 @@ class _PlayerScreenState extends State<PlayerScreen>
     final position = controller.value.position;
     final wasPlaying = controller.value.isPlaying;
 
+    _failedUrls.remove(variant.url);
     setState(() {
       _isLoading = true;
       _selectedVariant = variant;
     });
 
+    _disposeVideo();
     await _startController(startAt: position, autoplay: wasPlaying);
     if (mounted) setState(() => _isLoading = false);
+  }
+
+  /// Открывает официальный трейлер во встроенном YouTube-плеере.
+  ///
+  /// Мост к iframe отдаёт паузу, звук, качество и ошибки ролика, поэтому
+  /// отдельный видеоконтроллер здесь не нужен. Ошибка ролика не блокирует
+  /// экран: остаются повтор и переход на YouTube.
+  void _openTrailer(VideoStream stream) {
+    final id = stream.youtubeId;
+    if (id == null || id.isEmpty) {
+      _failVideo(_item);
+      return;
+    }
+
+    _isTrailer = true;
+    _trailerFailed = false;
+    _videoFailed = false;
+    _duration = null;
+    _elapsed.value = Duration.zero;
+    _playing = true;
+
+    try {
+      final controller = yt.YoutubePlayerController.fromVideoId(
+        videoId: id,
+        autoPlay: true,
+        params: const yt.YoutubePlayerParams(
+          showControls: true,
+          showFullscreenButton: true,
+          interfaceLanguage: 'ru',
+          captionLanguage: 'ru',
+          showVideoAnnotations: false,
+          strictRelatedVideos: true,
+        ),
+      );
+      _youtube = controller;
+      if (_muted) {
+        unawaited(controller.mute());
+      } else {
+        unawaited(controller.setVolume((_volume * 100).round()));
+      }
+      _youtubeSub = controller.stream.listen((value) {
+        if (!mounted || !identical(_youtube, controller)) return;
+
+        if (value.hasError) {
+          _onTrailerError();
+          return;
+        }
+        if (value.playerState == yt.PlayerState.ended) {
+          _controlsTimer?.cancel();
+          if (_playing) setState(() => _playing = false);
+          return;
+        }
+
+        final playing =
+            value.playerState == yt.PlayerState.playing ||
+            value.playerState == yt.PlayerState.buffering;
+        if (playing != _playing) setState(() => _playing = playing);
+      });
+    } catch (_) {
+      _trailerFailed = true;
+      _playing = false;
+    }
+  }
+
+  void _onTrailerError() {
+    if (!mounted || _trailerFailed) return;
+    setState(() {
+      _trailerFailed = true;
+      _playing = false;
+    });
+  }
+
+  /// Открывает ролик на YouTube в браузере.
+  ///
+  /// Встроенный плеер может быть недоступен (например, из-за настроек
+  /// устройства), но сам ролик всегда можно посмотреть на сайте.
+  Future<void> _openOnYoutube() async {
+    final stream = _videoStream;
+    final page = stream?.pageUrl;
+    final id = stream?.youtubeId;
+    final url = page != null && page.isNotEmpty
+        ? page
+        : id != null && id.isNotEmpty
+        ? 'https://www.youtube.com/watch?v=$id'
+        : null;
+    if (url == null) return;
+
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+
+    var opened = false;
+    try {
+      opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      opened = false;
+    }
+
+    if (!opened && mounted) {
+      _notify('Не удалось открыть YouTube');
+    }
+  }
+
+  void _notify(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 3)),
+    );
   }
 
   /// Сообщает, что поток открыть не удалось.
@@ -394,33 +645,74 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
-  /// Освобождает видеоконтроллер и таймер скрытия оверлея.
+  /// Пробует следующий файл источника, если текущий кадр сломался.
+  Future<void> _handleVideoError() async {
+    if (_starting || _recovering) return;
+    _recovering = true;
+
+    if (_selectedVariant != null) {
+      _failedUrls.add(_selectedVariant!.url);
+    }
+    final position = _video?.value.position;
+    final wasPlaying = _playing;
+
+    _disposeVideo();
+    if (mounted) {
+      setState(() {
+        _videoFailed = false;
+        _isLoading = true;
+      });
+    }
+
+    try {
+      final stream = _videoStream;
+      if (stream == null || _candidatesFor(stream).isEmpty) {
+        _failVideo(_item);
+        return;
+      }
+      await _startController(startAt: position, autoplay: wasPlaying);
+      if (mounted) setState(() => _isLoading = false);
+    } finally {
+      _recovering = false;
+    }
+  }
+
+  /// Освобождает видеоконтроллер, YouTube-плеер и таймер оверлея.
   void _disposeVideo() {
     _controlsTimer?.cancel();
     _controlsTimer = null;
+    _starting = false;
 
     final controller = _video;
     _video = null;
-    if (controller == null) return;
+    if (controller != null) {
+      controller.removeListener(_onVideoTick);
+      unawaited(controller.dispose());
+    }
 
-    controller.removeListener(_onVideoTick);
-    unawaited(controller.dispose());
+    final youtube = _youtube;
+    _youtube = null;
+    final subscription = _youtubeSub;
+    _youtubeSub = null;
+    unawaited(subscription?.cancel());
+    if (youtube != null) {
+      unawaited(youtube.close().catchError((Object _) {}));
+    }
+
+    _isTrailer = false;
+    _trailerFailed = false;
+    _videoFailed = false;
   }
 
   /// Синхронизирует интерфейс с состоянием видеоплеера.
   void _onVideoTick() {
     final controller = _video;
-    if (controller == null || !mounted) return;
+    if (controller == null || !mounted || _starting) return;
 
     final value = controller.value;
 
     if (value.hasError) {
-      if (!_videoFailed) {
-        setState(() {
-          _videoFailed = true;
-          _playing = false;
-        });
-      }
+      unawaited(_handleVideoError());
       return;
     }
 
@@ -503,6 +795,13 @@ class _PlayerScreenState extends State<PlayerScreen>
   void _applyVolume() {
     final effective = _muted ? 0.0 : _volume;
     if (_usesVideo) unawaited(_video!.setVolume(effective));
+    if (_usesTrailer) {
+      unawaited(
+        _muted
+            ? _youtube!.mute()
+            : _youtube!.setVolume((_volume * 100).round()),
+      );
+    }
     if (_usesPlayer) unawaited(_audio.setVolume(effective));
   }
 
@@ -522,21 +821,26 @@ class _PlayerScreenState extends State<PlayerScreen>
   /// Возвращает `false`, если подходящей записи нет или она не открылась —
   /// тогда вызывающий код переходит к следующему шагу.
   Future<bool> _openResolved(MediaItem item) async {
-    final stream = await context.read<TrackStreamResolver>().resolve(
-      title: item.title,
-      artist: item.subtitle,
-    );
-    if (stream == null || !mounted) return false;
+    try {
+      final stream = await context
+          .read<TrackStreamResolver>()
+          .resolve(title: item.title, artist: item.subtitle)
+          .timeout(const Duration(seconds: 20));
+      if (stream == null || !mounted) return false;
 
-    if (!await _open(
-      AudioEngine.sourceFor(stream.url, tag: _notificationItem(item)),
-    )) {
+      if (!await _open(
+        AudioEngine.sourceFor(stream.url, tag: _notificationItem(item)),
+      )) {
+        return false;
+      }
+
+      _usingDemo = false;
+      _usingFragment = !stream.isFullLength;
+      return true;
+    } catch (_) {
+      // Сеть, таймаут и ошибки провайдера одинаково означают «записи нет».
       return false;
     }
-
-    _usingDemo = false;
-    _usingFragment = !stream.isFullLength;
-    return true;
   }
 
   /// Метаданные карточки в системном плеере телефона.
@@ -569,7 +873,9 @@ class _PlayerScreenState extends State<PlayerScreen>
   /// Возвращает `false`, если источник недоступен.
   Future<bool> _open(AudioSource source) async {
     try {
-      final duration = await _audio.setAudioSource(source);
+      final duration = await _audio
+          .setAudioSource(source)
+          .timeout(const Duration(seconds: 25));
       if (!mounted) return true;
 
       _duration = duration;
@@ -630,6 +936,11 @@ class _PlayerScreenState extends State<PlayerScreen>
   Future<void> _switchTo(int index) async {
     if (index < 0 || index >= _queue.length) return;
 
+    // Сохраняем прогресс покидаемого элемента, пока он ещё текущий.
+    _persistProgress();
+    // Ответы источника для прошлого элемента больше не должны применяться.
+    _loadToken++;
+
     await _audio.stop();
     _disposeVideo();
     _progressController.stop();
@@ -666,6 +977,17 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   Future<void> _togglePlay() async {
     _showControls();
+
+    // Трейлером управляет мост к YouTube; позиции у него нет.
+    if (_usesTrailer) {
+      final player = _youtube!;
+      if (_playing) {
+        await player.pauseVideo();
+      } else {
+        await player.playVideo();
+      }
+      return;
+    }
 
     // Видео управляется собственным контроллером.
     if (_usesVideo) {
@@ -773,8 +1095,16 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   /// Сохраняем прогресс просмотра в каталоге при выходе с экрана.
+  ///
+  /// Для трейлера прогресса нет: он не является просмотром полной версии,
+  /// поэтому карточка не должна получать ложную полосу «продолжить».
   void _persistProgress() {
-    context.read<CatalogCubit>().updateProgress(widget.item.id, _progressValue);
+    final item = _item;
+    if (item.isVideo && (_isTrailer || item.origin.isTrailerOnly)) return;
+
+    final value = _progressValue;
+    if (value <= 0) return;
+    context.read<CatalogCubit>().updateProgress(item.id, value);
   }
 
   /// Длительность текущего элемента.
@@ -809,6 +1139,7 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   @override
   void dispose() {
+    _loadToken++;
     _playerStateSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
@@ -888,19 +1219,28 @@ class _PlayerScreenState extends State<PlayerScreen>
                               if (velocity > 160) _skip(-1);
                             },
                       child: item.isVideo
-                          ? VideoStage(
-                              controller: _video,
-                              item: item,
-                              qualityLabel: _qualityLabel,
-                              loading: _isLoading,
-                              failed: _videoFailed,
-                              playing: _playing,
-                              showControls: _controlsVisible,
-                              onTogglePlay: _togglePlay,
-                              onToggleControls: _toggleControls,
-                              onRetry: _loadCurrent,
-                              onOpenFullscreen: _openFullscreen,
-                            )
+                          ? (_isTrailer
+                                ? TrailerStage(
+                                    controller: _youtube,
+                                    item: item,
+                                    loading: _isLoading,
+                                    failed: _trailerFailed,
+                                    onRetry: _loadCurrent,
+                                    onOpenExternal: _openOnYoutube,
+                                  )
+                                : VideoStage(
+                                    controller: _video,
+                                    item: item,
+                                    qualityLabel: _qualityLabel,
+                                    loading: _isLoading,
+                                    failed: _videoFailed,
+                                    playing: _playing,
+                                    showControls: _controlsVisible,
+                                    onTogglePlay: _togglePlay,
+                                    onToggleControls: _toggleControls,
+                                    onRetry: _loadCurrent,
+                                    onOpenFullscreen: _openFullscreen,
+                                  ))
                           : _AudioStage(
                               item: item,
                               rotation: _artworkController,
@@ -922,6 +1262,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Widget _buildControls(MediaItem item) {
+    if (item.isVideo && _isTrailer) return _buildTrailerControls(item);
+
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0.0, end: 1.0),
       duration: const Duration(milliseconds: 800),
@@ -1004,7 +1346,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                 _PlayButton(
                   playing: _playing,
                   isLoading: _isLoading,
-                  enabled: !_audioFailed,
+                  enabled: !_audioFailed && !_videoFailed,
                   accent: item.category.accent,
                   pulse: _pulseController,
                   onTap: _togglePlay,
@@ -1070,6 +1412,139 @@ class _PlayerScreenState extends State<PlayerScreen>
                       message: _previewNotice!,
                       isError: _noticeIsError,
                     ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Нижний блок для трейлера.
+  ///
+  /// У YouTube-ролика нет позиции и вариантов качества в нашем API, зато
+  /// есть собственные элементы управления внутри iframe. Поэтому вместо
+  /// шкалы и громкости здесь — пояснение источника, переход по очереди и
+  /// кнопка открытия ролика на YouTube.
+  Widget _buildTrailerControls(MediaItem item) {
+    final provider = _videoStream?.providerLabel ?? 'YouTube';
+    final accent = item.category.accent;
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.0, end: 1.0),
+      duration: const Duration(milliseconds: 700),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) => Transform.translate(
+        offset: Offset(0, 24 * (1 - value)),
+        child: Opacity(opacity: value, child: child),
+      ),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(24.w, 0, 24.w, 18.h),
+        child: Column(
+          children: [
+            Container(
+              padding: EdgeInsets.all(14.r),
+              decoration: BoxDecoration(
+                color: AppColors.surfaceHigh.withValues(alpha: 0.55),
+                borderRadius: BorderRadius.circular(18.r),
+                border: Border.all(
+                  color: _trailerFailed
+                      ? AppColors.error.withValues(alpha: 0.4)
+                      : AppColors.outline,
+                ),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 42.r,
+                    height: 42.r,
+                    decoration: BoxDecoration(
+                      color: accent.withValues(alpha: 0.16),
+                      borderRadius: BorderRadius.circular(13.r),
+                    ),
+                    child: Icon(
+                      Icons.smart_display_rounded,
+                      size: 22.r,
+                      color: accent,
+                    ),
+                  ),
+                  SizedBox(width: 12.w),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Официальный трейлер',
+                          style: TextStyle(
+                            fontSize: 13.5.sp,
+                            fontWeight: FontWeight.w800,
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        SizedBox(height: 3.h),
+                        Text(
+                          _trailerFailed
+                              ? 'Встроенный плеер недоступен — откройте ролик на YouTube.'
+                              : '$provider · полную версию смотрите в кинотеатрах',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11.5.sp,
+                            height: 1.35,
+                            fontWeight: FontWeight.w600,
+                            color: _trailerFailed
+                                ? AppColors.error
+                                : AppColors.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(height: 14.h),
+            Row(
+              children: [
+                if (_queue.length > 1) ...[
+                  _ToggleButton(
+                    icon: Icons.skip_previous_rounded,
+                    size: 30,
+                    onTap: () => _skip(-1),
+                    tooltip: 'Предыдущий',
+                  ),
+                  SizedBox(width: 10.w),
+                ],
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _openOnYoutube,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: accent,
+                      foregroundColor: AppColors.ink,
+                      padding: EdgeInsets.symmetric(vertical: 13.h),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14.r),
+                      ),
+                    ),
+                    icon: Icon(Icons.open_in_new_rounded, size: 18.r),
+                    label: Text(
+                      'Открыть на YouTube',
+                      style: TextStyle(
+                        fontSize: 13.sp,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ),
+                if (_queue.length > 1) ...[
+                  SizedBox(width: 10.w),
+                  _ToggleButton(
+                    icon: Icons.skip_next_rounded,
+                    size: 30,
+                    onTap: () => _skip(1),
+                    tooltip: 'Следующий',
+                  ),
+                ],
+              ],
             ),
           ],
         ),

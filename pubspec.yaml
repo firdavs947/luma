@@ -8,6 +8,7 @@ environment:
 
 dependencies:
   audio_session: ^0.2.2
+  cached_network_image: ^4.0.5
   crypto: ^3.0.7
   equatable: ^3.0.0
   file_picker: ^13.2.0
@@ -25,7 +26,9 @@ dependencies:
   path_provider: ^2.1.6
   permission_handler: ^11.4.0
   shared_preferences: ^2.5.6
+  url_launcher: ^6.3.3
   video_player: ^2.14.1
+  youtube_player_iframe: ^6.0.2
 
 dev_dependencies:
   flutter_test:

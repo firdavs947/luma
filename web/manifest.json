@@ -1,11 +1,11 @@
 {
-    "name": "animation_test_app",
-    "short_name": "animation_test_app",
+    "name": "LUMA",
+    "short_name": "LUMA",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "LUMA — фильмы, сериалы, аниме и музыка.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

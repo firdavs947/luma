@@ -13,7 +13,7 @@ import 'features/auth/domain/auth_repository.dart';
 import 'features/auth/presentation/bloc/auth_bloc.dart';
 import 'features/auth/presentation/bloc/auth_event.dart';
 import 'features/auth/presentation/bloc/auth_state.dart';
-import 'features/catalog/data/archive_video_source.dart';
+import 'features/catalog/data/aggregated_video_source.dart';
 import 'features/catalog/data/audius_music_source.dart';
 import 'features/catalog/data/genius_music_source.dart';
 import 'features/catalog/data/mock_music_source.dart';
@@ -57,11 +57,11 @@ class LumaApp extends StatelessWidget {
         RepositoryProvider<TrackStreamResolver>(
           create: (_) => StreamingTrackResolver(),
         ),
-        // Видеоконтент: фильмы, аниме, мультфильмы и сериалы из Internet
-        // Archive. Ключ не нужен, контент легальный, квот нет. Тот же
-        // экземпляр использует плеер, чтобы разрешать поток выбранного
-        // качества под скорость соединения.
-        RepositoryProvider<VideoSource>(create: (_) => ArchiveVideoSource()),
+        // Видеоконтент: свежие фильмы, сериалы и мультфильмы из Cinemeta,
+        // актуальный сезон аниме из AniList и полные фильмы общественного
+        // достояния из Internet Archive. Ключи не нужны, контент легальный.
+        // Тот же экземпляр использует плеер, чтобы разрешать поток.
+        RepositoryProvider<VideoSource>(create: (_) => AggregatedVideoSource()),
       ],
       child: Builder(
         builder: (context) => MultiBlocProvider(
@@ -71,8 +71,8 @@ class LumaApp extends StatelessWidget {
             ),
             BlocProvider<CatalogCubit>(
               create: (context) => CatalogCubit(
-                // Видеокаталог приходит из Internet Archive: он покрывает
-                // все четыре видеонаправления и отдаёт готовые потоки.
+                // Видеокаталог собирается из трёх бесплатных источников:
+                // Cinemeta, AniList и Internet Archive.
                 videoSource: context.read<VideoSource>(),
                 // Основной источник — Audius: он отдаёт полные версии треков
                 // из неограниченной библиотеки и умеет постраничный поиск.

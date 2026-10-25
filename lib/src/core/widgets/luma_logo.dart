@@ -118,6 +118,9 @@ class LumaLogoPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final s = size.shortestSide;
+    // Нулевой размер встречается в скрытых вкладках и тестах: градиент
+    // с пустым прямоугольником на CanvasKit роняет кадр.
+    if (s <= 0) return;
 
     if (showBackground) {
       _paintBackdrop(canvas, s);

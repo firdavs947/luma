@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
@@ -23,14 +25,27 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final _pageController = PageController();
   int _index = 0;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _requestNotificationPermission();
+  }
+
+  /// Возврат из фона — повод обновить новинки.
+  ///
+  /// Каталог обновляется сам по таймеру, но телефон мог спать несколько
+  /// часов: проверка устаревания сразу после возврата показывает свежие
+  /// релизы без ручного обновления.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(context.read<CatalogCubit>().refreshIfStale());
+    }
   }
 
   /// Запрос разрешения на уведомления для Android 13+.
@@ -45,6 +60,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pageController.dispose();
     super.dispose();
   }
